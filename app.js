@@ -1,0 +1,758 @@
+// ========== مدیریت داده‌ها (LocalStorage) ==========
+const STORAGE_KEY = "link-manager-data-v3";
+
+const defaultData = {
+  categories: [
+    { id: "all", name: "همه لینک‌ها", isSystem: true, color: "#4f6ef7" },
+    { id: "cat-1", name: "کار", isSystem: false, color: "#4f6ef7" },
+    { id: "cat-2", name: "سرگرمی", isSystem: false, color: "#e74c3c" },
+    { id: "cat-3", name: "آموزش", isSystem: false, color: "#27ae60" },
+  ],
+  links: [],
+  theme: "light",
+  activeCategory: "all",
+};
+
+function loadData() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return structuredClone(defaultData);
+    const parsed = JSON.parse(raw);
+    if (!parsed.categories.some((c) => c.id === "all")) {
+      parsed.categories.unshift({ id: "all", name: "همه لینک‌ها", isSystem: true, color: "#4f6ef7" });
+    }
+    parsed.categories.forEach((c) => { if (!c.color) c.color = "#4f6ef7"; });
+    return { ...defaultData, ...parsed };
+  } catch {
+    return structuredClone(defaultData);
+  }
+}
+
+function saveData(data) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch (e) {
+    if (e.name === "QuotaExceededError") {
+      alert("حافظه مرورگر پر شد. لطفاً چند لینک یا عکس را حذف کنید.");
+    }
+  }
+}
+
+let state = loadData();
+let searchQuery = "";
+let pendingImageData = null; // base64 از فایل محلی
+
+// ========== المان‌ها ==========
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
+
+const categoryList = $("#category-list");
+const linksContainer = $("#links-container");
+const emptyState = $("#empty-state");
+const noResults = $("#no-results");
+const currentCategoryTitle = $("#current-category-title");
+const linkCount = $("#link-count");
+const themeToggle = $("#theme-toggle");
+const themeIcon = themeToggle.querySelector(".theme-icon");
+const searchInput = $("#search-input");
+const searchClear = $("#search-clear");
+
+const linkForm = $("#link-form");
+const linkModalTitle = $("#link-modal-title");
+const linkIdInput = $("#link-id");
+const linkTitleInput = $("#link-title");
+const linkUrlInput = $("#link-url");
+const linkCategorySelect = $("#link-category");
+const linkDescInput = $("#link-desc");
+const linkImageInput = $("#link-image");
+const linkImageDataInput = $("#link-image-data");
+const linkImageFile = $("#link-image-file");
+const imagePreview = $("#image-preview");
+
+const categoryForm = $("#category-form");
+const categoryNameInput = $("#category-name");
+const categoryColorInput = $("#category-color");
+
+const confirmMessage = $("#confirm-message");
+const confirmDeleteBtn = $("#confirm-delete-btn");
+
+let pendingDelete = null;
+
+// ========== تم (روشن → دارک → طوسی) ==========
+const THEMES = ["light", "dark", "slate"];
+const THEME_ICONS = { light: "🌙", dark: "☀️", slate: "🩶" };
+
+function applyTheme(theme) {
+  if (!THEMES.includes(theme)) theme = "light";
+  document.documentElement.setAttribute("data-theme", theme);
+  themeIcon.textContent = THEME_ICONS[theme] || "🌙";
+  state.theme = theme;
+  saveData(state);
+}
+
+function toggleTheme() {
+  const idx = THEMES.indexOf(state.theme);
+  const next = THEMES[(idx + 1) % THEMES.length];
+  applyTheme(next);
+}
+
+// ========== ساعت عقربه‌ای ==========
+function updateClock() {
+  const now = new Date();
+  const h = now.getHours() % 12;
+  const m = now.getMinutes();
+  const s = now.getSeconds();
+  const hourDeg = h * 30 + m * 0.5;
+  const minDeg = m * 6 + s * 0.1;
+  const secDeg = s * 6;
+  const hourHand = document.getElementById("hour-hand");
+  const minuteHand = document.getElementById("minute-hand");
+  const secondHand = document.getElementById("second-hand");
+  if (hourHand) hourHand.style.transform = `rotate(${hourDeg}deg)`;
+  if (minuteHand) minuteHand.style.transform = `rotate(${minDeg}deg)`;
+  if (secondHand) secondHand.style.transform = `rotate(${secDeg}deg)`;
+}
+
+// ========== تاریخ شمسی (جلالی) ==========
+const JALALI_WEEKDAYS = ["یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه"];
+const JALALI_MONTHS = [
+  "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
+  "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"
+];
+
+function gregorianToJalali(gy, gm, gd) {
+  const g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+  let jy = gy <= 1600 ? 0 : 979;
+  gy -= gy <= 1600 ? 621 : 1600;
+  const gy2 = gm > 2 ? gy + 1 : gy;
+  let days =
+    365 * gy +
+    Math.floor((gy2 + 3) / 4) -
+    Math.floor((gy2 + 99) / 100) +
+    Math.floor((gy2 + 399) / 400) -
+    80 +
+    gd +
+    g_d_m[gm - 1];
+  jy += 33 * Math.floor(days / 12053);
+  days %= 12053;
+  jy += 4 * Math.floor(days / 1461);
+  days %= 1461;
+  if (days > 365) {
+    jy += Math.floor((days - 1) / 365);
+    days = (days - 1) % 365;
+  }
+  const jm = days < 186 ? 1 + Math.floor(days / 31) : 7 + Math.floor((days - 186) / 30);
+  const jd = 1 + (days < 186 ? days % 31 : (days - 186) % 30);
+  return { jy, jm, jd };
+}
+
+function updateJalaliDate() {
+  const now = new Date();
+  const { jy, jm, jd } = gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
+  const weekday = JALALI_WEEKDAYS[now.getDay()];
+  const weekdayEl = document.getElementById("jalali-weekday");
+  const fullEl = document.getElementById("jalali-full");
+  if (weekdayEl) weekdayEl.textContent = weekday;
+  if (fullEl) fullEl.textContent = `${jd} ${JALALI_MONTHS[jm - 1]} ${jy}`;
+}
+
+// ========== کش تصویر برای آفلاین ==========
+/** تبدیل URL تصویر به base64 و ذخیره در لینک */
+async function cacheImageAsBase64(url) {
+  if (!url || url.startsWith("data:")) return url;
+  try {
+    const res = await fetch(url, { mode: "cors" });
+    if (!res.ok) throw new Error("fetch failed");
+    const blob = await res.blob();
+    // فقط تصاویر کوچک‌تر از ~500KB
+    if (blob.size > 500 * 1024) return null;
+    return await blobToBase64(blob);
+  } catch {
+    // fallback: canvas برای فاویکون‌ها (ممکن است CORS بزند)
+    return null;
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+function getFaviconUrl(url) {
+  try {
+    const domain = new URL(url).hostname;
+    return `https://www.google.com/s2/favicons?domain=${domain}&sz=128`;
+  } catch {
+    return null;
+  }
+}
+
+/** منبع نهایی نمایش تصویر (اولویت: cached > image > favicon) */
+function getDisplayImage(link) {
+  if (link.imageCached) return link.imageCached;
+  if (link.image) return link.image;
+  return getFaviconUrl(link.url);
+}
+
+/** وقتی آنلاین هستیم، فاویکون/عکس را کش کن */
+async function ensureImageCached(link) {
+  if (link.imageCached) return link;
+  if (!navigator.onLine) return link;
+
+  let src = link.image || getFaviconUrl(link.url);
+  if (!src || src.startsWith("data:")) {
+    if (src && src.startsWith("data:")) {
+      link.imageCached = src;
+    }
+    return link;
+  }
+
+  const cached = await cacheImageAsBase64(src);
+  if (cached) {
+    link.imageCached = cached;
+    // ذخیره در state
+    const idx = state.links.findIndex((l) => l.id === link.id);
+    if (idx !== -1) {
+      state.links[idx].imageCached = cached;
+      saveData(state);
+    }
+  }
+  return link;
+}
+
+// ========== رندر دسته‌بندی‌ها (نوار افقی ۳ بعدی) ==========
+function renderCategories() {
+  categoryList.innerHTML = "";
+
+  state.categories.forEach((cat) => {
+    const count =
+      cat.id === "all"
+        ? state.links.length
+        : state.links.filter((l) => l.categoryId === cat.id).length;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `cat-chip${state.activeCategory === cat.id ? " active" : ""}`;
+    btn.style.background = `linear-gradient(145deg, ${lighten(cat.color, 12)}, ${cat.color})`;
+    btn.dataset.id = cat.id;
+
+    btn.innerHTML = `
+      <span>${escapeHtml(cat.name)}</span>
+      <span class="cat-count">${count}</span>
+      ${
+        !cat.isSystem
+          ? `<span class="cat-delete" data-action="delete-cat" title="حذف دسته‌بندی">✕</span>`
+          : ""
+      }
+    `;
+
+    btn.addEventListener("click", (e) => {
+      if (e.target.closest("[data-action]")) return;
+      state.activeCategory = cat.id;
+      saveData(state);
+      renderCategories();
+      renderLinks();
+    });
+
+    const del = btn.querySelector('[data-action="delete-cat"]');
+    if (del) {
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openConfirm(`آیا می‌خواهید دسته‌بندی «${cat.name}» را حذف کنید؟`, {
+          type: "category",
+          id: cat.id,
+        });
+      });
+    }
+
+    categoryList.appendChild(btn);
+  });
+}
+
+function lighten(hex, percent) {
+  try {
+    const num = parseInt(hex.replace("#", ""), 16);
+    const r = Math.min(255, (num >> 16) + Math.round(2.55 * percent));
+    const g = Math.min(255, ((num >> 8) & 0xff) + Math.round(2.55 * percent));
+    const b = Math.min(255, (num & 0xff) + Math.round(2.55 * percent));
+    return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0")}`;
+  } catch {
+    return hex;
+  }
+}
+
+// ========== فیلتر ==========
+function getFilteredLinks() {
+  let links =
+    state.activeCategory === "all"
+      ? [...state.links]
+      : state.links.filter((l) => l.categoryId === state.activeCategory);
+
+  if (searchQuery) {
+    const q = searchQuery.toLowerCase();
+    links = links.filter(
+      (l) =>
+        l.title.toLowerCase().includes(q) ||
+        l.url.toLowerCase().includes(q) ||
+        (l.desc && l.desc.toLowerCase().includes(q))
+    );
+  }
+  return links;
+}
+
+// ========== رندر لینک‌ها ==========
+function renderLinks() {
+  const links = getFilteredLinks();
+  const activeCat = state.categories.find((c) => c.id === state.activeCategory);
+
+  currentCategoryTitle.textContent = activeCat ? activeCat.name : "همه لینک‌ها";
+  linkCount.textContent = links.length;
+
+  linksContainer.innerHTML = "";
+  emptyState.classList.add("hidden");
+  noResults.classList.add("hidden");
+
+  if (links.length === 0) {
+    if (searchQuery) noResults.classList.remove("hidden");
+    else emptyState.classList.remove("hidden");
+    return;
+  }
+
+  links.forEach((link) => {
+    const cat = state.categories.find((c) => c.id === link.categoryId);
+    const imgSrc = getDisplayImage(link);
+    // عکس سفارشی (آپلود یا URL) به‌صورت cover؛ فاویکون به‌صورت آیکون وسط
+    const isCustomImage = !!(link.image || (link.imageCached && link.image));
+    const useCover = isCustomImage && imgSrc && !imgSrc.includes("favicons");
+
+    const card = document.createElement("a");
+    card.className = "link-card";
+    card.href = link.url;
+    card.target = "_blank";
+    card.rel = "noopener noreferrer";
+
+    const iconHtml = imgSrc
+      ? `<img src="${escapeAttr(imgSrc)}" alt="" class="link-card-icon${useCover ? " cover" : ""}" loading="lazy"
+            onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" />
+         <span class="link-card-icon-fallback" style="display:none">✦</span>`
+      : `<span class="link-card-icon-fallback">✦</span>`;
+
+    card.innerHTML = `
+      <div class="link-card-icon-area">
+        ${iconHtml}
+      </div>
+      <div class="link-card-body">
+        <div class="link-card-title-row">
+          <span class="link-card-sparkle">✦</span>
+          <div class="link-card-title">${escapeHtml(link.title)}</div>
+        </div>
+        <div class="link-card-url">${escapeHtml(getDomain(link.url))}</div>
+        <div class="link-card-footer">
+          <div class="link-card-actions">
+            <button class="btn-icon danger" data-action="delete" title="حذف">🗑️</button>
+            <button class="btn-icon" data-action="edit" title="ویرایش">✏️</button>
+          </div>
+          <span class="link-card-cat" style="background:${cat ? cat.color : "#e91e63"}">${escapeHtml(cat ? cat.name : "بدون دسته")}</span>
+        </div>
+      </div>
+    `;
+
+    card.querySelector('[data-action="edit"]').addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openLinkModal(link);
+    });
+    card.querySelector('[data-action="delete"]').addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openConfirm(`آیا می‌خواهید لینک «${link.title}» را حذف کنید؟`, {
+        type: "link",
+        id: link.id,
+      });
+    });
+
+    linksContainer.appendChild(card);
+
+    if (!link.imageCached && navigator.onLine) {
+      ensureImageCached(link);
+    }
+  });
+}
+
+function getDomain(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+// ========== مودال لینک ==========
+function populateCategorySelect(selectedId = null) {
+  linkCategorySelect.innerHTML = "";
+  const cats = state.categories.filter((c) => !c.isSystem);
+  if (cats.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "ابتدا یک دسته‌بندی بسازید";
+    opt.disabled = true;
+    opt.selected = true;
+    linkCategorySelect.appendChild(opt);
+    return;
+  }
+  cats.forEach((cat) => {
+    const opt = document.createElement("option");
+    opt.value = cat.id;
+    opt.textContent = cat.name;
+    if (selectedId && selectedId === cat.id) opt.selected = true;
+    linkCategorySelect.appendChild(opt);
+  });
+}
+
+function openLinkModal(link = null) {
+  pendingImageData = null;
+  linkImageFile.value = "";
+  switchImageTab("url");
+
+  if (link) {
+    linkModalTitle.textContent = "ویرایش لینک";
+    linkIdInput.value = link.id;
+    linkTitleInput.value = link.title;
+    linkUrlInput.value = link.url;
+    linkDescInput.value = link.desc || "";
+    linkImageInput.value = link.image && !link.image.startsWith("data:") ? link.image : "";
+    linkImageDataInput.value = link.imageCached || (link.image && link.image.startsWith("data:") ? link.image : "");
+    pendingImageData = linkImageDataInput.value || null;
+    populateCategorySelect(link.categoryId);
+  } else {
+    linkModalTitle.textContent = "افزودن لینک جدید";
+    linkIdInput.value = "";
+    linkTitleInput.value = "";
+    linkUrlInput.value = "";
+    linkDescInput.value = "";
+    linkImageInput.value = "";
+    linkImageDataInput.value = "";
+    populateCategorySelect(state.activeCategory !== "all" ? state.activeCategory : null);
+  }
+  updateImagePreview();
+  openModal("link-modal");
+  setTimeout(() => linkTitleInput.focus(), 100);
+}
+
+function updateImagePreview() {
+  imagePreview.innerHTML = "";
+  let src = pendingImageData || linkImageDataInput.value || linkImageInput.value.trim();
+
+  if (!src) {
+    const url = linkUrlInput.value.trim();
+    if (url) {
+      let finalUrl = url;
+      if (!/^https?:\/\//i.test(finalUrl)) finalUrl = "https://" + finalUrl;
+      src = getFaviconUrl(finalUrl);
+    }
+  }
+
+  if (src) {
+    const img = document.createElement("img");
+    img.src = src;
+    img.alt = "پیش‌نمایش";
+    img.onerror = () => {
+      imagePreview.innerHTML = '<span class="preview-placeholder">📷</span>';
+    };
+    imagePreview.appendChild(img);
+  } else {
+    imagePreview.innerHTML = '<span class="preview-placeholder">📷</span>';
+  }
+}
+
+async function handleLinkSubmit(e) {
+  e.preventDefault();
+
+  const title = linkTitleInput.value.trim();
+  let url = linkUrlInput.value.trim();
+  const categoryId = linkCategorySelect.value;
+  const desc = linkDescInput.value.trim();
+  const imageUrl = linkImageInput.value.trim();
+  const id = linkIdInput.value;
+
+  if (!title || !url) return;
+  if (!categoryId) {
+    alert("لطفاً ابتدا یک دسته‌بندی بسازید.");
+    return;
+  }
+  if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+
+  // تصویر نهایی
+  let image = imageUrl || null;
+  let imageCached = pendingImageData || null;
+
+  // اگر عکس URL داده شده و هنوز کش نشده، سعی کن کش کنی
+  if (image && !imageCached && navigator.onLine) {
+    imageCached = await cacheImageAsBase64(image);
+  }
+
+  // اگر هیچ عکسی نیست، فاویکون را کش کن
+  if (!image && !imageCached && navigator.onLine) {
+    const fav = getFaviconUrl(url);
+    if (fav) {
+      imageCached = await cacheImageAsBase64(fav);
+    }
+  }
+
+  const linkData = {
+    title,
+    url,
+    categoryId,
+    desc,
+    image: image,
+    imageCached: imageCached,
+  };
+
+  if (id) {
+    const idx = state.links.findIndex((l) => l.id === id);
+    if (idx !== -1) {
+      state.links[idx] = { ...state.links[idx], ...linkData };
+    }
+  } else {
+    state.links.push({
+      id: "link-" + Date.now(),
+      ...linkData,
+      createdAt: Date.now(),
+    });
+  }
+
+  saveData(state);
+  closeModal("link-modal");
+  renderCategories();
+  renderLinks();
+}
+
+// ========== تب‌های منبع عکس ==========
+function switchImageTab(tab) {
+  $$(".img-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
+  $("#img-url-panel").classList.toggle("hidden", tab !== "url");
+  $("#img-file-panel").classList.toggle("hidden", tab !== "file");
+}
+
+$$(".img-tab").forEach((tab) => {
+  tab.addEventListener("click", () => switchImageTab(tab.dataset.tab));
+});
+
+// آپلود از هارد
+linkImageFile.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  if (file.size > 2 * 1024 * 1024) {
+    alert("حجم فایل نباید بیشتر از ۲ مگابایت باشد.");
+    return;
+  }
+  if (!file.type.startsWith("image/")) {
+    alert("فقط فایل تصویری مجاز است.");
+    return;
+  }
+  try {
+    // فشرده‌سازی ساده با canvas اگر بزرگ باشد
+    const base64 = await compressImage(file, 400, 0.8);
+    pendingImageData = base64;
+    linkImageDataInput.value = base64;
+    linkImageInput.value = ""; // پاک کردن URL
+    updateImagePreview();
+  } catch {
+    alert("خطا در خواندن فایل.");
+  }
+});
+
+function compressImage(file, maxSize, quality) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let { width, height } = img;
+      if (width > maxSize || height > maxSize) {
+        if (width > height) {
+          height = Math.round((height * maxSize) / width);
+          width = maxSize;
+        } else {
+          width = Math.round((width * maxSize) / height);
+          height = maxSize;
+        }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+// درگ و دراپ
+const fileDrop = document.querySelector(".file-drop");
+if (fileDrop) {
+  ["dragenter", "dragover"].forEach((ev) => {
+    fileDrop.addEventListener(ev, (e) => {
+      e.preventDefault();
+      fileDrop.classList.add("dragover");
+    });
+  });
+  ["dragleave", "drop"].forEach((ev) => {
+    fileDrop.addEventListener(ev, (e) => {
+      e.preventDefault();
+      fileDrop.classList.remove("dragover");
+    });
+  });
+  fileDrop.addEventListener("drop", (e) => {
+    const file = e.dataTransfer.files?.[0];
+    if (file) {
+      linkImageFile.files = e.dataTransfer.files;
+      linkImageFile.dispatchEvent(new Event("change"));
+    }
+  });
+}
+
+// ========== مودال دسته‌بندی ==========
+function openCategoryModal() {
+  categoryNameInput.value = "";
+  categoryColorInput.value = "#4f6ef7";
+  $$(".color-swatch").forEach((s) => s.classList.remove("active"));
+  $$(".color-swatch")[0]?.classList.add("active");
+  openModal("category-modal");
+  setTimeout(() => categoryNameInput.focus(), 100);
+}
+
+function handleCategorySubmit(e) {
+  e.preventDefault();
+  const name = categoryNameInput.value.trim();
+  const color = categoryColorInput.value || "#4f6ef7";
+  if (!name) return;
+  if (state.categories.some((c) => c.name === name)) {
+    alert("این نام دسته‌بندی قبلاً وجود دارد.");
+    return;
+  }
+  state.categories.push({
+    id: "cat-" + Date.now(),
+    name,
+    color,
+    isSystem: false,
+  });
+  saveData(state);
+  closeModal("category-modal");
+  renderCategories();
+  populateCategorySelect();
+}
+
+document.getElementById("color-picker").addEventListener("click", (e) => {
+  const swatch = e.target.closest(".color-swatch");
+  if (!swatch) return;
+  $$(".color-swatch").forEach((s) => s.classList.remove("active"));
+  swatch.classList.add("active");
+  categoryColorInput.value = swatch.dataset.color;
+});
+
+// ========== حذف ==========
+function openConfirm(message, payload) {
+  confirmMessage.textContent = message;
+  pendingDelete = payload;
+  openModal("confirm-modal");
+}
+
+function handleConfirmDelete() {
+  if (!pendingDelete) return;
+  if (pendingDelete.type === "link") {
+    state.links = state.links.filter((l) => l.id !== pendingDelete.id);
+  } else if (pendingDelete.type === "category") {
+    state.links = state.links.map((l) =>
+      l.categoryId === pendingDelete.id ? { ...l, categoryId: null } : l
+    );
+    state.categories = state.categories.filter((c) => c.id !== pendingDelete.id);
+    if (state.activeCategory === pendingDelete.id) state.activeCategory = "all";
+  }
+  pendingDelete = null;
+  saveData(state);
+  closeModal("confirm-modal");
+  renderCategories();
+  renderLinks();
+}
+
+// ========== مودال ==========
+function openModal(id) {
+  document.getElementById(id)?.classList.remove("hidden");
+}
+function closeModal(id) {
+  document.getElementById(id)?.classList.add("hidden");
+}
+
+document.addEventListener("click", (e) => {
+  if (e.target.classList.contains("modal-overlay") || e.target.hasAttribute("data-close")) {
+    const modal = e.target.closest(".modal");
+    if (modal) modal.classList.add("hidden");
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $$(".modal:not(.hidden)").forEach((m) => m.classList.add("hidden"));
+});
+
+// ========== جستجو ==========
+searchInput.addEventListener("input", () => {
+  searchQuery = searchInput.value.trim();
+  searchClear.classList.toggle("hidden", !searchQuery);
+  renderLinks();
+});
+searchClear.addEventListener("click", () => {
+  searchInput.value = "";
+  searchQuery = "";
+  searchClear.classList.add("hidden");
+  renderLinks();
+  searchInput.focus();
+});
+
+linkImageInput.addEventListener("input", () => {
+  pendingImageData = null;
+  linkImageDataInput.value = "";
+  updateImagePreview();
+});
+linkUrlInput.addEventListener("input", updateImagePreview);
+linkUrlInput.addEventListener("blur", updateImagePreview);
+
+// ========== ابزار ==========
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str || "";
+  return div.innerHTML;
+}
+function escapeAttr(str) {
+  return (str || "").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// ========== رویدادها ==========
+themeToggle.addEventListener("click", toggleTheme);
+$("#add-link-btn").addEventListener("click", () => openLinkModal());
+$("#add-category-btn").addEventListener("click", openCategoryModal);
+linkForm.addEventListener("submit", handleLinkSubmit);
+categoryForm.addEventListener("submit", handleCategorySubmit);
+confirmDeleteBtn.addEventListener("click", handleConfirmDelete);
+
+// ========== شروع ==========
+applyTheme(state.theme || "light");
+renderCategories();
+renderLinks();
+updateClock();
+updateJalaliDate();
+setInterval(updateClock, 1000);
+// تاریخ را هر دقیقه چک کن (برای تغییر نیمه‌شب)
+setInterval(updateJalaliDate, 60000);
+
+// وقتی آنلاین شد، تصاویر بدون کش را به‌روز کن
+window.addEventListener("online", () => {
+  state.links.forEach((link) => {
+    if (!link.imageCached) ensureImageCached(link);
+  });
+});
