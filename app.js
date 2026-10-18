@@ -1,5 +1,6 @@
-// ========== مدیریت داده‌ها (LocalStorage) ==========
+// ========== مدیریت داده‌ها (LocalStorage + ابر) ==========
 const STORAGE_KEY = "link-manager-data-v3";
+const SYNC_CONFIG_KEY = "link-manager-sync-config";
 
 const defaultData = {
   categories: [
@@ -11,6 +12,7 @@ const defaultData = {
   links: [],
   theme: "light",
   activeCategory: "all",
+  updatedAt: 0,
 };
 
 function loadData() {
@@ -28,7 +30,26 @@ function loadData() {
   }
 }
 
-function saveData(data) {
+function loadSyncConfig() {
+  try {
+    const raw = localStorage.getItem(SYNC_CONFIG_KEY);
+    if (!raw) return { enabled: false, apiKey: "", binId: "" };
+    return JSON.parse(raw);
+  } catch {
+    return { enabled: false, apiKey: "", binId: "" };
+  }
+}
+
+function saveSyncConfig(cfg) {
+  localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(cfg));
+}
+
+let syncConfig = loadSyncConfig();
+let syncTimer = null;
+let isSyncing = false;
+
+function saveData(data, options = {}) {
+  data.updatedAt = Date.now();
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
   } catch (e) {
@@ -36,11 +57,16 @@ function saveData(data) {
       alert("حافظه مرورگر پر شد. لطفاً چند لینک یا عکس را حذف کنید.");
     }
   }
+  // ارسال خودکار به سرور (با تأخیر کوتاه)
+  if (!options.skipCloud && syncConfig.enabled && syncConfig.apiKey && syncConfig.binId) {
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(() => pushToCloud(false), 800);
+  }
 }
 
 let state = loadData();
 let searchQuery = "";
-let pendingImageData = null; // base64 از فایل محلی
+let pendingImageData = null;
 
 // ========== المان‌ها ==========
 const $ = (sel) => document.querySelector(sel);
@@ -740,6 +766,199 @@ linkForm.addEventListener("submit", handleLinkSubmit);
 categoryForm.addEventListener("submit", handleCategorySubmit);
 confirmDeleteBtn.addEventListener("click", handleConfirmDelete);
 
+// ========== همگام‌سازی ابری (JSONBin.io) ==========
+function setSyncStatus(text, type = "") {
+  const el = document.getElementById("sync-status");
+  if (!el) return;
+  el.textContent = text;
+  el.className = "sync-status" + (type ? " " + type : "");
+}
+
+function showSyncMessage(text, type) {
+  const el = document.getElementById("sync-message");
+  if (!el) return;
+  el.textContent = text;
+  el.className = "sync-message " + type;
+  el.classList.remove("hidden");
+}
+
+function getCloudPayload() {
+  return {
+    categories: state.categories,
+    links: state.links,
+    theme: state.theme,
+    activeCategory: state.activeCategory,
+    updatedAt: state.updatedAt || Date.now(),
+  };
+}
+
+async function pushToCloud(showAlert = true) {
+  if (!syncConfig.apiKey || !syncConfig.binId) {
+    if (showAlert) showSyncMessage("ابتدا Master Key و Bin ID را وارد کنید.", "err");
+    return false;
+  }
+  if (isSyncing) return false;
+  isSyncing = true;
+  setSyncStatus("در حال ارسال…", "syncing");
+  try {
+    const res = await fetch(`https://api.jsonbin.io/v3/b/${syncConfig.binId}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Master-Key": syncConfig.apiKey,
+        "X-Bin-Versioning": "false",
+      },
+      body: JSON.stringify(getCloudPayload()),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(errText || `خطا ${res.status}`);
+    }
+    setSyncStatus("ذخیره روی سرور ✓", "ok");
+    if (showAlert) showSyncMessage("با موفقیت به سرور ارسال شد.", "ok");
+    return true;
+  } catch (e) {
+    console.error(e);
+    setSyncStatus("خطا در ارسال", "err");
+    if (showAlert) showSyncMessage("ارسال ناموفق: " + (e.message || "اتصال را بررسی کنید"), "err");
+    return false;
+  } finally {
+    isSyncing = false;
+  }
+}
+
+async function pullFromCloud(showAlert = true) {
+  if (!syncConfig.apiKey || !syncConfig.binId) {
+    if (showAlert) showSyncMessage("ابتدا Master Key و Bin ID را وارد کنید.", "err");
+    return false;
+  }
+  if (isSyncing) return false;
+  isSyncing = true;
+  setSyncStatus("در حال دریافت…", "syncing");
+  try {
+    const res = await fetch(`https://api.jsonbin.io/v3/b/${syncConfig.binId}/latest`, {
+      method: "GET",
+      headers: {
+        "X-Master-Key": syncConfig.apiKey,
+      },
+    });
+    if (!res.ok) throw new Error(`خطا ${res.status}`);
+    const json = await res.json();
+    const remote = json.record || json;
+
+    if (!remote || (!remote.categories && !remote.links)) {
+      // سرور خالی است — داده‌های محلی را بفرست
+      setSyncStatus("سرور خالی — ارسال محلی…", "syncing");
+      isSyncing = false;
+      return await pushToCloud(showAlert);
+    }
+
+    // نرمال‌سازی
+    if (!Array.isArray(remote.categories)) remote.categories = structuredClone(defaultData.categories);
+    if (!remote.categories.some((c) => c.id === "all")) {
+      remote.categories.unshift({ id: "all", name: "همه لینک‌ها", isSystem: true, color: "#4f6ef7" });
+    }
+    remote.categories.forEach((c) => { if (!c.color) c.color = "#4f6ef7"; });
+    if (!Array.isArray(remote.links)) remote.links = [];
+
+    state = {
+      ...defaultData,
+      ...remote,
+      theme: remote.theme || state.theme,
+    };
+    saveData(state, { skipCloud: true });
+    applyTheme(state.theme || "light");
+    renderCategories();
+    renderLinks();
+    setSyncStatus("همگام با سرور ✓", "ok");
+    if (showAlert) showSyncMessage("داده‌ها از سرور دریافت شد.", "ok");
+    return true;
+  } catch (e) {
+    console.error(e);
+    setSyncStatus("خطا در دریافت", "err");
+    if (showAlert) showSyncMessage("دریافت ناموفق: " + (e.message || "اتصال را بررسی کنید"), "err");
+    return false;
+  } finally {
+    isSyncing = false;
+  }
+}
+
+function openSyncModal() {
+  document.getElementById("sync-api-key").value = syncConfig.apiKey || "";
+  document.getElementById("sync-bin-id").value = syncConfig.binId || "";
+  document.getElementById("sync-enabled").checked = !!syncConfig.enabled;
+  document.getElementById("sync-message").classList.add("hidden");
+  openModal("sync-modal");
+}
+
+function saveSyncSettings() {
+  syncConfig = {
+    apiKey: document.getElementById("sync-api-key").value.trim(),
+    binId: document.getElementById("sync-bin-id").value.trim(),
+    enabled: document.getElementById("sync-enabled").checked,
+  };
+  saveSyncConfig(syncConfig);
+  if (syncConfig.enabled && syncConfig.apiKey && syncConfig.binId) {
+    showSyncMessage("تنظیمات ذخیره شد. در حال همگام‌سازی…", "ok");
+    pullFromCloud(true).then((ok) => {
+      if (ok) setTimeout(() => pushToCloud(false), 500);
+    });
+  } else {
+    showSyncMessage("تنظیمات ذخیره شد. همگام‌سازی غیرفعال است.", "ok");
+    setSyncStatus(syncConfig.enabled ? "تنظیمات ناقص" : "همگام‌سازی خاموش", "");
+  }
+}
+
+// خروجی / ورود فایل
+function exportData() {
+  const blob = new Blob([JSON.stringify(getCloudPayload(), null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `linkbox-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function importData(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(reader.result);
+      if (!data.categories && !data.links) throw new Error("فرمت نامعتبر");
+      if (!Array.isArray(data.categories)) data.categories = structuredClone(defaultData.categories);
+      if (!data.categories.some((c) => c.id === "all")) {
+        data.categories.unshift({ id: "all", name: "همه لینک‌ها", isSystem: true, color: "#4f6ef7" });
+      }
+      if (!Array.isArray(data.links)) data.links = [];
+      state = { ...defaultData, ...data };
+      saveData(state);
+      applyTheme(state.theme || "light");
+      renderCategories();
+      renderLinks();
+      showSyncMessage("فایل با موفقیت وارد شد.", "ok");
+      alert("داده‌ها وارد شد.");
+    } catch (e) {
+      alert("خطا در خواندن فایل: " + (e.message || ""));
+    }
+  };
+  reader.readAsText(file);
+}
+
+// رویدادهای همگام‌سازی
+document.getElementById("sync-settings-btn")?.addEventListener("click", openSyncModal);
+document.getElementById("sync-save-btn")?.addEventListener("click", saveSyncSettings);
+document.getElementById("sync-push-btn")?.addEventListener("click", () => pushToCloud(true));
+document.getElementById("sync-pull-btn")?.addEventListener("click", () => pullFromCloud(true));
+document.getElementById("export-btn")?.addEventListener("click", exportData);
+document.getElementById("import-btn")?.addEventListener("click", () => {
+  document.getElementById("import-file").click();
+});
+document.getElementById("import-file")?.addEventListener("change", (e) => {
+  const file = e.target.files?.[0];
+  if (file) importData(file);
+  e.target.value = "";
+});
+
 // ========== شروع ==========
 applyTheme(state.theme || "light");
 renderCategories();
@@ -747,12 +966,28 @@ renderLinks();
 updateClock();
 updateJalaliDate();
 setInterval(updateClock, 1000);
-// تاریخ را هر دقیقه چک کن (برای تغییر نیمه‌شب)
 setInterval(updateJalaliDate, 60000);
 
-// وقتی آنلاین شد، تصاویر بدون کش را به‌روز کن
+// اگر همگام‌سازی فعال است، از سرور بگیر
+if (syncConfig.enabled && syncConfig.apiKey && syncConfig.binId) {
+  setSyncStatus("در حال همگام‌سازی…", "syncing");
+  pullFromCloud(false);
+} else {
+  setSyncStatus(syncConfig.enabled ? "تنظیمات ناقص" : "محلی (بدون سرور)", "");
+}
+
+// هر ۶۰ ثانیه در پس‌زمینه از سرور بگیر (اگر فعال باشد)
+setInterval(() => {
+  if (syncConfig.enabled && syncConfig.apiKey && syncConfig.binId && navigator.onLine && !isSyncing) {
+    pullFromCloud(false);
+  }
+}, 60000);
+
 window.addEventListener("online", () => {
   state.links.forEach((link) => {
     if (!link.imageCached) ensureImageCached(link);
   });
+  if (syncConfig.enabled && syncConfig.apiKey && syncConfig.binId) {
+    pullFromCloud(false);
+  }
 });
